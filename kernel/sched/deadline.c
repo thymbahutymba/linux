@@ -2222,7 +2222,7 @@ out:
 	return ret;
 }
 
-static int push_dl_task(struct rq *rq)
+static int push_dl_task_first_fit(struct rq *rq)
 {
 	struct task_struct *next_task;
 	struct rq *suitable_rq;
@@ -2287,6 +2287,13 @@ out:
 	put_task_struct(next_task);
 
 	return ret;
+}
+
+static int push_dl_task(struct rq *rq) {
+	if (global_dl_sched_is_first_fit())
+		return push_dl_task_first_fit(rq);
+	else
+		return push_dl_task_global_edf(rq);
 }
 
 static void push_dl_tasks(struct rq *rq)
@@ -2377,7 +2384,16 @@ skip:
 		resched_curr(this_rq);
 }
 
+static void pull_dl_task_first_fit(struct rq *this_rq) {
+	return;
+}
+
 static void pull_dl_task(struct rq *this_rq) {
+	if (global_dl_sched_is_first_fit())
+		pull_dl_task_first_fit(this_rq);
+	else
+		pull_dl_task_global_edf(this_rq);
+
 	return;
 }
 

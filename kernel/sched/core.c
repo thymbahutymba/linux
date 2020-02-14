@@ -73,6 +73,9 @@ __read_mostly int scheduler_running;
  */
 int sysctl_sched_rt_runtime = 950000;
 
+/* Use global EDF as default. */
+unsigned int sysctl_sched_dl_policy = 0;
+
 /*
  * __task_rq_lock - lock the rq @p resides on.
  */

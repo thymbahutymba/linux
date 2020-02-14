@@ -1614,6 +1614,25 @@ static inline u64 global_rt_runtime(void)
 	return (u64)sysctl_sched_rt_runtime * NSEC_PER_USEC;
 }
 
+#define SCHED_DL_GEDF (0)
+#define SCHED_DL_FF (1)
+#define SCHED_DL_WF (2)
+
+static inline unsigned int global_sched_dl_is_gedf(void)
+{
+	return sysctl_sched_dl_policy == SCHED_DL_GEDF;
+}
+
+static inline unsigned int global_sched_dl_is_first_fit(void)
+{
+	return sysctl_sched_dl_policy == SCHED_DL_FF;
+}
+
+static inline unsigned int global_sched_dl_is_worst_fit(void)
+{
+	return sysctl_sched_dl_policy == SCHED_DL_WF;
+}
+
 static inline int task_current(struct rq *rq, struct task_struct *p)
 {
 	return rq->curr == p;
