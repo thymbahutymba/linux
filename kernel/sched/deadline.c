@@ -1671,23 +1671,32 @@ static void migrate_task_rq_dl(struct task_struct *p, int new_cpu __maybe_unused
 }
 
 static int first_fit_cpudl_find(struct task_struct *, struct cpumask *);
+static int worst_fit_cpudl_find(struct task_struct *, struct cpumask *, u64 *);
 
 static void check_preempt_equal_dl(struct rq *rq, struct task_struct *p)
 {
+	int found;
+
+	/* Extend this check with respect to new two policies */
+	if (global_sched_dl_is_first_fit())
+		found = first_fit_cpudl_find(rq->curr, NULL);
+	else if (global_sched_dl_is_worst_fit())
+		found = worst_fit_cpudl_find(rq->curr, NULL, NULL);
+	else
+		found = cpudl_find(&rq->rd->cpudl, rq->curr, NULL);
+
 	/*
 	 * Current can't be migrated, useless to reschedule,
 	 * let's hope p can move out.
 	 */
-	if (rq->curr->nr_cpus_allowed == 1 ||
-	    !first_fit_cpudl_find(rq->curr, NULL))
+	if (rq->curr->nr_cpus_allowed == 1 || !found)
 		return;
 
 	/*
 	 * p is migratable, so let's not schedule it and
 	 * see if it is pushed or pulled somewhere else.
 	 */
-	if (p->nr_cpus_allowed != 1 &&
-	    first_fit_cpudl_find(p, NULL))
+	if (p->nr_cpus_allowed != 1 && found)
 		return;
 
 	resched_curr(rq);
@@ -1903,7 +1912,7 @@ static int first_fit_cpudl_find(struct task_struct *p, struct cpumask *suitable_
 	return 0;
 }
 
-static int find_suitable_rq(struct task_struct *task)
+static int find_ff_suitable_rq(struct task_struct *task)
 {
 	struct cpumask *suitable_mask = this_cpu_cpumask_var_ptr(local_cpu_mask_dl);
 	int best_cpu;
@@ -1916,6 +1925,69 @@ static int find_suitable_rq(struct task_struct *task)
 		return -1;
 
 	if (!first_fit_cpudl_find(task, suitable_mask)){
+		return -1;
+	}
+
+	/*
+	 * As long as we are here this means that the task fit into one rq and that
+	 * one is the only one in the suitable_mask.
+	 */
+	if((best_cpu = cpumask_any(suitable_mask)) < nr_cpu_ids)
+		return best_cpu;
+	else
+		return -1;
+}
+
+static int worst_fit_cpudl_find(struct task_struct *p, struct cpumask *suitable_mask, u64 *bw_best_cpu)
+{
+	const struct sched_dl_entity *dl_se = &p->dl;
+	int cpu, t_cpu = task_cpu(p);
+	struct rq *cpu_rq;
+	u64 cpu_bw, min_bw = -1;
+	const u64 bw = to_ratio(global_rt_period(), global_rt_runtime());
+	int ret = 0;
+
+	cpumask_clear(suitable_mask);
+
+	for_each_online_cpu(cpu) {
+		cpu_rq = cpu_rq(cpu);
+
+		/* Compute how much bandwidth is used in cpu_rq */
+		cpu_bw = (cpu == t_cpu) ? (cpu_rq->dl.this_bw - dl_se->dl_bw) : cpu_rq->dl.this_bw;
+
+		/*
+		 * min_bw = -1 is the largest u64 and it's handled as invalid value. 
+		 * The check of min_bw is the second one in order to check such 
+		 * condition only at the first iteration.
+		 * The rq has to have enough bw for the task.
+		 */
+		if ((cpu_bw < min_bw || min_bw == -1) && (bw - cpu_bw) >= dl_se->dl_bw) {
+			cpumask_clear(suitable_mask);
+			cpumask_set_cpu(cpu, suitable_mask);
+
+			min_bw = cpu_bw;
+			*bw_best_cpu = cpu_bw;
+
+			ret = 1;
+		}
+	}
+
+	return ret;
+}
+
+static int find_wf_suitable_rq(struct task_struct *task, u64 *bw_best_cpu)
+{
+	struct cpumask *suitable_mask = this_cpu_cpumask_var_ptr(local_cpu_mask_dl);
+	int best_cpu;
+
+	/* Make sure the mask is initialized first */
+	if (unlikely(!suitable_mask))
+		return -1;
+
+	if (task->nr_cpus_allowed == 1)
+		return -1;
+
+	if (!worst_fit_cpudl_find(task, suitable_mask, bw_best_cpu)){
 		return -1;
 	}
 
@@ -2074,8 +2146,60 @@ static struct rq *find_lock_later_rq(struct task_struct *task, struct rq *rq)
 	return later_rq;
 }
 
+static struct rq *find_lock_wf_suitable_rq(struct task_struct *task, struct rq *rq)
+{
+	struct rq *suitable_rq = NULL;
+	int tries;
+	int cpu;
+	u64 cpu_bw_before, cpu_bw_now;
+
+	for (tries = 0; tries < DL_MAX_TRIES; tries++) {
+		cpu = find_wf_suitable_rq(task, &cpu_bw_before);
+
+		if ((cpu == -1) || (cpu == rq->cpu))
+			break;
+
+		suitable_rq = cpu_rq(cpu);
+
+		/* Retry if something changed. */
+		if (double_lock_balance(rq, suitable_rq)) {
+			if (unlikely(task_rq(task) != rq ||
+				     !cpumask_test_cpu(suitable_rq->cpu, task->cpus_ptr) ||
+				     task_running(rq, task) ||
+				     !dl_task(task) ||
+				     !task_on_rq_queued(task))) {
+				double_unlock_balance(rq, suitable_rq);
+				suitable_rq = NULL;
+				break;
+			}
+		}
+
+		cpu_bw_now = suitable_rq->dl.this_bw;
+
+		/* The bw of the found cpu isn't changed after the double_lock */
+		if (cpu_bw_now == cpu_bw_before)
+			break;
+
+		/* 
+		 * The current rq has more left bandwidth of the suitable_rq.
+		 * Something happened before acquire the double_lock otherwise 
+		 * such condition shouldn't be true. The task is left where it is.
+		 */
+		if (cpu_bw_now > rq->dl.this_bw){
+			suitable_rq = rq;
+			break;
+		}
+
+		/* Otherwise we try again. */
+		double_unlock_balance(rq, suitable_rq);
+		suitable_rq = NULL;
+	}
+
+	return suitable_rq;
+}
+
 /* Locks the rq it finds */
-static struct rq *find_lock_suitable_rq(struct task_struct *task, struct rq *rq)
+static struct rq *find_lock_ff_suitable_rq(struct task_struct *task, struct rq *rq)
 {
 	struct rq *suitable_rq = NULL;
 	int tries;
@@ -2084,7 +2208,7 @@ static struct rq *find_lock_suitable_rq(struct task_struct *task, struct rq *rq)
 	const struct sched_dl_entity *dl_se = &task->dl;
 
 	for (tries = 0; tries < DL_MAX_TRIES; tries++) {
-		cpu = find_suitable_rq(task);
+		cpu = find_ff_suitable_rq(task);
 
 		if ((cpu == -1) || (cpu == rq->cpu))
 			break;
@@ -2222,6 +2346,73 @@ out:
 	return ret;
 }
 
+static int push_dl_task_worst_fit(struct rq *rq)
+{
+	struct task_struct *next_task;
+	struct rq *suitable_rq;
+	int ret = 0;
+
+	next_task = pick_next_pushable_dl_task(rq);
+	if (!next_task)
+		return 0;
+
+retry:
+	if (WARN_ON(next_task == rq->curr))
+		return 0;
+
+	/* We might release rq lock */
+	get_task_struct(next_task);
+
+	/* Will lock the rq it'll find */
+	suitable_rq = find_lock_wf_suitable_rq(next_task, rq);
+
+	if (!suitable_rq) {
+		struct task_struct *task;
+
+		/*
+		 * We must check all this again, since
+		 * find_lock_suitable_rq releases rq->lock and it is
+		 * then possible that next_task has migrated.
+		 */
+		task = pick_next_pushable_dl_task(rq);
+		if (task == next_task) {
+			/*
+			 * The task is still there. We don't try
+			 * again, some other CPU will pull it when ready.
+			 */
+			goto out;
+		}
+
+		if (!task)
+			/* No more tasks */
+			goto out;
+
+		put_task_struct(next_task);
+		next_task = task;
+		goto retry;
+	}
+
+	deactivate_task(rq, next_task, 0);
+	set_task_cpu(next_task, suitable_rq->cpu);
+
+	/*
+	 * Update the later_rq clock here, because the clock is used
+	 * by the cpufreq_update_util() inside __add_running_bw().
+	 */
+	update_rq_clock(suitable_rq);
+	activate_task(suitable_rq, next_task, ENQUEUE_NOCLOCK);
+	ret = 1;
+
+	resched_curr(suitable_rq);
+
+	double_unlock_balance(rq, suitable_rq);
+
+out:
+	put_task_struct(next_task);
+
+	return ret;
+}
+
 static int push_dl_task_first_fit(struct rq *rq)
 {
 	struct task_struct *next_task;
@@ -2240,7 +2431,7 @@ retry:
 	get_task_struct(next_task);
 
 	/* Will lock the rq it'll find */	
-	suitable_rq = find_lock_suitable_rq(next_task, rq);
+	suitable_rq = find_lock_ff_suitable_rq(next_task, rq);
 	
 	if (!suitable_rq) {
 		struct task_struct *task;
@@ -2290,8 +2481,10 @@ out:
 }
 
 static int push_dl_task(struct rq *rq) {
-	if (global_dl_sched_is_first_fit())
+	if (global_sched_dl_is_first_fit())
 		return push_dl_task_first_fit(rq);
+	else if (global_sched_dl_is_worst_fit())
+		return push_dl_task_worst_fit(rq);
 	else
 		return push_dl_task_global_edf(rq);
 }
@@ -2388,9 +2581,15 @@ static void pull_dl_task_first_fit(struct rq *this_rq) {
 	return;
 }
 
+static void pull_dl_task_worst_fit(struct rq *this_rq) {
+	return;
+}
+
 static void pull_dl_task(struct rq *this_rq) {
-	if (global_dl_sched_is_first_fit())
+	if (global_sched_dl_is_first_fit())
 		pull_dl_task_first_fit(this_rq);
+	else if (global_sched_dl_is_worst_fit())
+		pull_dl_task_worst_fit(this_rq);
 	else
 		pull_dl_task_global_edf(this_rq);
 
