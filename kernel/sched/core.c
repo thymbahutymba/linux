@@ -76,6 +76,9 @@ int sysctl_sched_rt_runtime = 950000;
 /* Use global EDF as default. */
 unsigned int sysctl_sched_dl_policy = 0;
 
+/* Fallback to G-EDF disabled by default. */
+unsigned int sysctl_sched_dl_fallback_to_gedf = 0;
+
 /*
  * __task_rq_lock - lock the rq @p resides on.
  */

@@ -1633,6 +1633,11 @@ static inline unsigned int global_sched_dl_is_worst_fit(void)
 	return sysctl_sched_dl_policy == SCHED_DL_WF;
 }
 
+static inline unsigned int global_sched_dl_fallback_to_gedf(void)
+{
+	return sysctl_sched_dl_fallback_to_gedf;
+}
+
 static inline int task_current(struct rq *rq, struct task_struct *p)
 {
 	return rq->curr == p;

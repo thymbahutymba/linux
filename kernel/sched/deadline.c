@@ -1881,6 +1881,8 @@ next_node:
 
 static DEFINE_PER_CPU(cpumask_var_t, local_cpu_mask_dl);
 
+static int fallback_to_gedf = 0;
+
 static int first_fit_cpudl_find(struct task_struct *p, struct cpumask *suitable_mask)
 {
 	const struct sched_dl_entity *dl_se = &p->dl;
@@ -2151,13 +2153,21 @@ static struct rq *find_lock_wf_suitable_rq(struct task_struct *task, struct rq *
 	struct rq *suitable_rq = NULL;
 	int tries;
 	int cpu;
-	u64 cpu_bw_before, cpu_bw_now;
+	u64 cpu_bw_before = -1, cpu_bw_now;
 
 	for (tries = 0; tries < DL_MAX_TRIES; tries++) {
 		cpu = find_wf_suitable_rq(task, &cpu_bw_before);
 
-		if ((cpu == -1) || (cpu == rq->cpu))
+		if (cpu == rq->cpu)
 			break;
+
+		/* Set fallback to G-EDF in case no rq has enough bw for the task */
+		if (cpu == -1){
+			fallback_to_gedf = 1;
+			break;
+		}
+
+		fallback_to_gedf = 0;
 
 		suitable_rq = cpu_rq(cpu);
 
@@ -2210,8 +2220,16 @@ static struct rq *find_lock_ff_suitable_rq(struct task_struct *task, struct rq *
 	for (tries = 0; tries < DL_MAX_TRIES; tries++) {
 		cpu = find_ff_suitable_rq(task);
 
-		if ((cpu == -1) || (cpu == rq->cpu))
+		if (cpu == rq->cpu)
 			break;
+
+		/* Set fallback to G-EDF in case no rq has enough bw for the task */
+		if (cpu == -1) {
+			fallback_to_gedf = 1;
+			break;
+		}
+
+		fallback_to_gedf = 0;
 
 		suitable_rq = cpu_rq(cpu);
 
@@ -2366,6 +2384,13 @@ retry:
 	/* Will lock the rq it'll find */
 	suitable_rq = find_lock_wf_suitable_rq(next_task, rq);
 
+	/* 
+	 * It doesn't make sense to proceed with the push if we have to fallback to 
+	 * G-EDF.
+	 */
+	if (global_sched_dl_fallback_to_gedf() && fallback_to_gedf)
+		goto out;
+
 	if (!suitable_rq) {
 		struct task_struct *task;
 
@@ -2430,8 +2455,15 @@ retry:
 	/* We might release rq lock */
 	get_task_struct(next_task);
 
-	/* Will lock the rq it'll find */	
+	/* Will lock the rq it'll find */
 	suitable_rq = find_lock_ff_suitable_rq(next_task, rq);
+
+	/* 
+	 * It doesn't make sense to proceed with the push if we have to fallback to 
+	 * G-EDF.
+	 */
+	if (global_sched_dl_fallback_to_gedf() && fallback_to_gedf)
+		goto out;
 	
 	if (!suitable_rq) {
 		struct task_struct *task;
@@ -2481,12 +2513,22 @@ out:
 }
 
 static int push_dl_task(struct rq *rq) {
+	int ret = 0;
+
 	if (global_sched_dl_is_first_fit())
-		return push_dl_task_first_fit(rq);
+		ret = push_dl_task_first_fit(rq);
 	else if (global_sched_dl_is_worst_fit())
-		return push_dl_task_worst_fit(rq);
-	else
-		return push_dl_task_global_edf(rq);
+		ret = push_dl_task_worst_fit(rq);
+
+	/*
+	 * Whether the sched_policy is set to G-EDF or is enabled and is required 
+	 * the fallback to it.
+	 */
+	if (global_sched_dl_is_gedf() || 
+		(global_sched_dl_fallback_to_gedf() && fallback_to_gedf))
+		ret = push_dl_task_global_edf(rq);
+
+	return ret;
 }
 
 static void push_dl_tasks(struct rq *rq)
