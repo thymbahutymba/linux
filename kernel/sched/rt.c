@@ -2702,7 +2702,11 @@ static int sched_rt_global_validate(void)
 		return -EINVAL;
 
 	if ((sysctl_sched_rt_runtime != RUNTIME_INF) &&
-		(sysctl_sched_rt_runtime > sysctl_sched_rt_period))
+	    (sysctl_sched_rt_runtime > sysctl_sched_rt_period))
+		return -EINVAL;
+
+	if ((sysctl_sched_dl_xf_runtime != RUNTIME_INF) &&
+	    (sysctl_sched_dl_xf_runtime > sysctl_sched_rt_period))
 		return -EINVAL;
 
 	return 0;
@@ -2718,13 +2722,14 @@ int sched_rt_handler(struct ctl_table *table, int write,
 		void __user *buffer, size_t *lenp,
 		loff_t *ppos)
 {
-	int old_period, old_runtime;
+	int old_period, old_runtime, old_xf_runtime;
 	static DEFINE_MUTEX(mutex);
 	int ret;
 
 	mutex_lock(&mutex);
 	old_period = sysctl_sched_rt_period;
 	old_runtime = sysctl_sched_rt_runtime;
+	old_xf_runtime = sysctl_sched_dl_xf_runtime;
 
 	ret = proc_dointvec(table, write, buffer, lenp, ppos);
 
@@ -2748,6 +2753,7 @@ int sched_rt_handler(struct ctl_table *table, int write,
 undo:
 		sysctl_sched_rt_period = old_period;
 		sysctl_sched_rt_runtime = old_runtime;
+		sysctl_sched_dl_xf_runtime = old_xf_runtime;
 	}
 	mutex_unlock(&mutex);
 

@@ -73,6 +73,20 @@ __read_mostly int scheduler_running;
  */
 int sysctl_sched_rt_runtime = 950000;
 
+int sysctl_sched_dl_xf_runtime = 950000;
+
+/* Use global EDF as default. */
+unsigned int sysctl_sched_dl_policy = 0;
+
+/* Fallback to G-EDF disabled by default. */
+unsigned int sysctl_sched_dl_fallback_to_gedf = 0;
+
+/*
+ * When invariance is enabled, the rq bw exceed check
+ * is skipped in order to always apply the xf policy.
+ */
+unsigned int sysctl_sched_dl_xf_invariance = 0;
+
 /*
  * __task_rq_lock - lock the rq @p resides on.
  */
@@ -4997,6 +5011,7 @@ change:
 		if (oldprio < p->prio)
 			queue_flags |= ENQUEUE_HEAD;
 
+		queue_flags |= ENQUEUE_SETSCHED;
 		enqueue_task(rq, p, queue_flags);
 	}
 	if (running)

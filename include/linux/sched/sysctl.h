@@ -56,6 +56,11 @@ int sched_proc_update_handler(struct ctl_table *table, int write,
 extern unsigned int sysctl_sched_rt_period;
 extern int sysctl_sched_rt_runtime;
 
+extern int sysctl_sched_dl_xf_runtime;
+extern unsigned int sysctl_sched_dl_xf_invariance;
+extern unsigned int sysctl_sched_dl_policy;
+extern unsigned int sysctl_sched_dl_fallback_to_gedf;
+
 #ifdef CONFIG_UCLAMP_TASK
 extern unsigned int sysctl_sched_uclamp_util_min;
 extern unsigned int sysctl_sched_uclamp_util_max;

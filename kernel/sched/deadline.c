@@ -527,14 +527,19 @@ static inline void deadline_queue_pull_task(struct rq *rq)
 }
 
 static struct rq *find_lock_later_rq(struct task_struct *task, struct rq *rq);
+static struct rq *find_lock_xf_suitable_rq(struct task_struct *task, struct rq *rq);
 
 static struct rq *dl_task_offline_migration(struct rq *rq, struct task_struct *p)
 {
-	struct rq *later_rq = NULL;
+	struct rq *best_rq = NULL;
 	struct dl_bw *dl_b;
 
-	later_rq = find_lock_later_rq(p, rq);
-	if (!later_rq) {
+	if (global_sched_dl_is_gedf())
+		best_rq = find_lock_later_rq(p, rq);
+	else
+		best_rq = find_lock_xf_suitable_rq(p, rq);
+
+	if (!best_rq) {
 		int cpu;
 
 		/*
@@ -556,8 +561,8 @@ static struct rq *dl_task_offline_migration(struct rq *rq, struct task_struct *p
 			 */
 			cpu = cpumask_any(cpu_active_mask);
 		}
-		later_rq = cpu_rq(cpu);
-		double_lock_balance(rq, later_rq);
+		best_rq = cpu_rq(cpu);
+		double_lock_balance(rq, best_rq);
 	}
 
 	if (p->dl.dl_non_contending || p->dl.dl_throttled) {
@@ -565,16 +570,16 @@ static struct rq *dl_task_offline_migration(struct rq *rq, struct task_struct *p
 		 * Inactive timer is armed (or callback is running, but
 		 * waiting for us to release rq locks). In any case, when it
 		 * will fire (or continue), it will see running_bw of this
-		 * task migrated to later_rq (and correctly handle it).
+		 * task migrated to best_rq (and correctly handle it).
 		 */
 		sub_running_bw(&p->dl, &rq->dl);
 		sub_rq_bw(&p->dl, &rq->dl);
 
-		add_rq_bw(&p->dl, &later_rq->dl);
-		add_running_bw(&p->dl, &later_rq->dl);
+		add_rq_bw(&p->dl, &best_rq->dl);
+		add_running_bw(&p->dl, &best_rq->dl);
 	} else {
 		sub_rq_bw(&p->dl, &rq->dl);
-		add_rq_bw(&p->dl, &later_rq->dl);
+		add_rq_bw(&p->dl, &best_rq->dl);
 	}
 
 	/*
@@ -587,15 +592,15 @@ static struct rq *dl_task_offline_migration(struct rq *rq, struct task_struct *p
 	__dl_sub(dl_b, p->dl.dl_bw, cpumask_weight(rq->rd->span));
 	raw_spin_unlock(&dl_b->lock);
 
-	dl_b = &later_rq->rd->dl_bw;
+	dl_b = &best_rq->rd->dl_bw;
 	raw_spin_lock(&dl_b->lock);
-	__dl_add(dl_b, p->dl.dl_bw, cpumask_weight(later_rq->rd->span));
+	__dl_add(dl_b, p->dl.dl_bw, cpumask_weight(best_rq->rd->span));
 	raw_spin_unlock(&dl_b->lock);
 
-	set_task_cpu(p, later_rq->cpu);
-	double_unlock_balance(later_rq, rq);
+	set_task_cpu(p, best_rq->cpu);
+	double_unlock_balance(best_rq, rq);
 
-	return later_rq;
+	return best_rq;
 }
 
 #else
@@ -1533,8 +1538,15 @@ static void enqueue_task_dl(struct rq *rq, struct task_struct *p, int flags)
 
 	enqueue_dl_entity(&p->dl, pi_se, flags);
 
-	if (!task_current(rq, p) && p->nr_cpus_allowed > 1)
+	if ((flags & ENQUEUE_SETSCHED || !task_current(rq, p)) && p->nr_cpus_allowed > 1) {
 		enqueue_pushable_dl_task(rq, p);
+		/*
+		 * Set push callback when enqueue is called by setscheduler. This also avoid
+		 * that the push is called twice when flags do not have ENQUEUE_SETSCHED set
+		 */
+		if (flags & ENQUEUE_SETSCHED)
+			deadline_queue_push_tasks(rq);
+	}
 }
 
 static void __dequeue_task_dl(struct rq *rq, struct task_struct *p, int flags)
@@ -1599,6 +1611,38 @@ static void yield_task_dl(struct rq *rq)
 #ifdef CONFIG_SMP
 
 static int find_later_rq(struct task_struct *task);
+static int find_xf_suitable_rq(struct task_struct *task, struct rq *rq);
+
+static inline s64 xf_dl_rq_bw_left(struct rq *rq)
+{
+	return to_ratio(global_rt_period(), global_sched_dl_xf_runtime()) -
+	       rq->dl.this_bw;
+}
+
+/*
+ * Highlight the fact that the rq bw is greater than the per-runqueue allowed
+ * bw, which means that the rq has more tasks than it can have, due to their
+ * bw requirement, even though they are currently inactive
+ */
+static inline bool xf_dl_rq_bw_exceed(struct rq *rq)
+{
+	return xf_dl_rq_bw_left(rq) < 0;
+}
+
+/*
+ * Deadline task fit into rq iff the left bw of such rq
+ * is greater or equal than the bw required by the task;
+ * moreover if the task already belong to the cpu_rq the
+ * cpu_rq bw has not to exceed the allowed limit.
+ */
+static inline bool xf_task_fit_cpu_rq(struct task_struct *task, int cpu)
+{
+	struct rq *cpu_rq = cpu_rq(cpu);
+	if (cpu == task_cpu(task))
+		return !xf_dl_rq_bw_exceed(cpu_rq);
+	else
+		return xf_dl_rq_bw_left(cpu_rq) >= (s64)task->dl.dl_bw;
+}
 
 static int
 select_task_rq_dl(struct task_struct *p, int cpu, int sd_flag, int flags)
@@ -1606,38 +1650,63 @@ select_task_rq_dl(struct task_struct *p, int cpu, int sd_flag, int flags)
 	struct task_struct *curr;
 	struct rq *rq;
 
-	if (sd_flag != SD_BALANCE_WAKE)
-		goto out;
-
 	rq = cpu_rq(cpu);
 
 	rcu_read_lock();
 	curr = READ_ONCE(rq->curr); /* unlocked access */
 
 	/*
-	 * If we are dealing with a -deadline task, we must
-	 * decide where to wake it up.
-	 * If it has a later deadline and the current task
-	 * on this rq can't move (provided the waking task
-	 * can!) we prefer to send it somewhere else. On the
-	 * other hand, if it has a shorter deadline, we
-	 * try to make it stay here, it might be important.
+	 * If the waking task can move on a different rq,
+	 * we must decide where to wake it up.
 	 */
 	if (unlikely(dl_task(curr)) &&
 	    (curr->nr_cpus_allowed < 2 ||
 	     !dl_entity_preempt(&p->dl, &curr->dl)) &&
-	    (p->nr_cpus_allowed > 1)) {
-		int target = find_later_rq(p);
+	    p->nr_cpus_allowed > 1) {
+		int target = cpu;
+		/*
+		 * If the current policy is either ff or wf and the left bw on
+		 * this rq is not enough for the waking task we have to move it
+		 * somewhere else. Moreover, if we are dealing with newly created
+		 * task, the policy has to be applied no matter the bandwidth
+		 */
+		if (!global_sched_dl_is_gedf() &&
+		    (sd_flag != SD_BALANCE_WAKE ||
+		     global_sched_dl_xf_invariance_enabled() ||
+		     xf_dl_rq_bw_exceed(rq))) {
+			target = find_xf_suitable_rq(p, rq);
 
-		if (target != -1 &&
-				(dl_time_before(p->dl.deadline,
-					cpu_rq(target)->dl.earliest_dl.curr) ||
-				(cpu_rq(target)->dl.dl_nr_running == 0)))
-			cpu = target;
+			if (target != -1)
+				cpu = target;
+		}
+
+		/*
+		 * If we are dealing with a -deadline task, gEDF is the
+		 * current dl policy or fallback to gEDF is enable and
+		 * required, if it has a later deadline and the current
+		 * task on this rq can't move (since the waking task can!)
+		 * we prefer to send it somewhere else.
+		 * On the other hand, if it has a shorter deadline, we try
+		 * to make it stay here, it might be important.
+		 */
+		if (global_sched_dl_is_gedf() ||
+		    (global_sched_dl_fallback_to_gedf() &&
+		     rq->dl.fallback_to_gedf)) {
+			if (target == -1)
+				rq->dl.fallback_to_gedf = 0;
+
+			target = find_later_rq(p);
+
+			if (target != -1 &&
+			    (dl_time_before(
+				     p->dl.deadline,
+				     cpu_rq(target)->dl.earliest_dl.curr) ||
+			     (cpu_rq(target)->dl.dl_nr_running == 0)))
+				cpu = target;
+		}
 	}
 	rcu_read_unlock();
 
-out:
 	return cpu;
 }
 
@@ -1672,22 +1741,33 @@ static void migrate_task_rq_dl(struct task_struct *p, int new_cpu __maybe_unused
 	raw_spin_unlock(&rq->lock);
 }
 
+static bool first_fit_cpu_find(struct task_struct *, struct cpumask *);
+static bool worst_fit_cpu_find(struct task_struct *, struct cpumask *);
+
 static void check_preempt_equal_dl(struct rq *rq, struct task_struct *p)
 {
+	int found;
+
+	/* Extend this check with respect to new two policies */
+	if (global_sched_dl_is_first_fit())
+		found = first_fit_cpu_find(rq->curr, NULL);
+	else if (global_sched_dl_is_worst_fit())
+		found = worst_fit_cpu_find(rq->curr, NULL);
+	else
+		found = cpudl_find(&rq->rd->cpudl, rq->curr, NULL);
+
 	/*
 	 * Current can't be migrated, useless to reschedule,
 	 * let's hope p can move out.
 	 */
-	if (rq->curr->nr_cpus_allowed == 1 ||
-	    !cpudl_find(&rq->rd->cpudl, rq->curr, NULL))
+	if (rq->curr->nr_cpus_allowed == 1 || !found)
 		return;
 
 	/*
 	 * p is migratable, so let's not schedule it and
 	 * see if it is pushed or pulled somewhere else.
 	 */
-	if (p->nr_cpus_allowed != 1 &&
-	    cpudl_find(&rq->rd->cpudl, p, NULL))
+	if (p->nr_cpus_allowed != 1 && found)
 		return;
 
 	resched_curr(rq);
@@ -1796,7 +1876,7 @@ static void put_prev_task_dl(struct rq *rq, struct task_struct *p)
 	update_curr_dl(rq);
 
 	update_dl_rq_load_avg(rq_clock_pelt(rq), rq, 1);
-	if (on_dl_rq(&p->dl) && p->nr_cpus_allowed > 1)
+	if (global_sched_dl_is_gedf() && on_dl_rq(&p->dl) && p->nr_cpus_allowed > 1)
 		enqueue_pushable_dl_task(rq, p);
 }
 
@@ -1871,6 +1951,84 @@ next_node:
 }
 
 static DEFINE_PER_CPU(cpumask_var_t, local_cpu_mask_dl);
+
+static bool first_fit_cpu_find(struct task_struct *p, struct cpumask *suitable_mask)
+{
+	int cpu;
+
+	if (suitable_mask)
+		cpumask_clear(suitable_mask);
+
+	for_each_cpu_and(cpu, p->cpus_ptr, cpu_online_mask) {
+		if (xf_task_fit_cpu_rq(p, cpu)) {
+			if (suitable_mask)
+				cpumask_set_cpu(cpu, suitable_mask);
+
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static bool worst_fit_cpu_find(struct task_struct *p, struct cpumask *suitable_mask)
+{
+	int cpu;
+	struct rq *cpu_rq;
+	u64 cpu_bw;
+	u64 min_bw = -1;
+	bool ret = false;
+
+	if (suitable_mask)
+		cpumask_clear(suitable_mask);
+
+	for_each_cpu_and(cpu, p->cpus_ptr, cpu_online_mask) {
+		cpu_rq = cpu_rq(cpu);
+		cpu_bw = (cpu == task_cpu(p)) ? (cpu_rq->dl.this_bw - p->dl.dl_bw) : cpu_rq->dl.this_bw;
+
+		/*
+		 * min_bw = -1 is the largest u64, thus it is possible
+		 * to keep track of the minimum bw between all the rqs
+		 */
+		if ((min_bw == -1 || cpu_bw < min_bw) && xf_task_fit_cpu_rq(p, cpu)) {
+			if (suitable_mask) {
+				cpumask_clear(suitable_mask);
+				cpumask_set_cpu(cpu, suitable_mask);
+			}
+
+			min_bw = cpu_bw;
+			ret = true;
+		}
+	}
+
+	return ret;
+}
+
+static int find_xf_suitable_rq(struct task_struct *task, struct rq *rq)
+{
+	struct cpumask suitable_mask;
+	int best_cpu;
+
+	if (task->nr_cpus_allowed == 1)
+		return -1;
+
+	if ((global_sched_dl_is_first_fit() &&
+	     !first_fit_cpu_find(task, &suitable_mask)) ||
+	    (global_sched_dl_is_worst_fit() &&
+	     !worst_fit_cpu_find(task, &suitable_mask))) {
+		rq->dl.fallback_to_gedf = 1;
+		return -1;
+	}
+
+	/*
+	 * As long as we are here this means that the task fit into one rq and that
+	 * one is the only one in the suitable_mask.
+	 */
+	if((best_cpu = cpumask_any(&suitable_mask)) < nr_cpu_ids)
+		return best_cpu;
+
+	return -1;
+}
 
 static int find_later_rq(struct task_struct *task)
 {
@@ -2017,6 +2175,67 @@ static struct rq *find_lock_later_rq(struct task_struct *task, struct rq *rq)
 	return later_rq;
 }
 
+static struct rq *find_lock_xf_suitable_rq(struct task_struct *task, struct rq *rq)
+{
+	struct rq *suitable_rq = NULL;
+	int tries;
+	int cpu;
+	/* Needed for worst fit only */
+	u64 cpu_bw_before_lock;
+	u64 cpu_bw_after_lock;
+
+	for (tries = 0; tries < DL_MAX_TRIES; tries++) {
+		cpu = find_xf_suitable_rq(task, rq);
+
+		if ((cpu == -1) || (cpu == rq->cpu))
+			break;
+
+		suitable_rq = cpu_rq(cpu);
+		cpu_bw_before_lock = suitable_rq->dl.this_bw;
+
+		/* Retry if something changed. */
+		if (double_lock_balance(rq, suitable_rq)) {
+			if (unlikely(task_rq(task) != rq ||
+				     !cpumask_test_cpu(suitable_rq->cpu, task->cpus_ptr) ||
+				     task_running(rq, task) ||
+				     !dl_task(task) ||
+				     !task_on_rq_queued(task))) {
+				double_unlock_balance(rq, suitable_rq);
+				suitable_rq = NULL;
+				break;
+			}
+		}
+
+		if (global_sched_dl_is_worst_fit()) {
+			/* The bw of the found cpu is not changed after the double_lock */
+			cpu_bw_after_lock = suitable_rq->dl.this_bw;
+			if (cpu_bw_after_lock == cpu_bw_before_lock)
+				break;
+
+			/*
+			 * The current rq has more left bandwidth of the suitable_rq.
+			 * Something happened before acquire the double_lock otherwise
+			 * such condition should not be true. The task is left where it is.
+			 */
+			if (cpu_bw_after_lock > rq->dl.this_bw) {
+				double_unlock_balance(rq, suitable_rq);
+				suitable_rq = NULL;
+				break;
+			}
+		} else {
+			/* Check again if the fit is still satisfied */
+			if (xf_dl_rq_bw_left(suitable_rq) >= (s64)task->dl.dl_bw)
+				break;
+		}
+
+		/* Otherwise we try again. */
+		double_unlock_balance(rq, suitable_rq);
+		suitable_rq = NULL;
+	}
+
+	return suitable_rq;
+}
+
 static struct task_struct *pick_next_pushable_dl_task(struct rq *rq)
 {
 	struct task_struct *p;
@@ -2042,7 +2261,7 @@ static struct task_struct *pick_next_pushable_dl_task(struct rq *rq)
  * can be sent to some other CPU where they can preempt
  * and start executing.
  */
-static int push_dl_task(struct rq *rq)
+static int push_dl_task_global_edf(struct rq *rq)
 {
 	struct task_struct *next_task;
 	struct rq *later_rq;
@@ -2123,6 +2342,110 @@ out:
 	return ret;
 }
 
+static int push_dl_task_xf(struct rq *rq)
+{
+	struct task_struct *next_task;
+	struct rq *suitable_rq;
+	int ret = 0;
+
+	/*
+	 * When the xf invariance is not enabled and the rq bw
+	 * does not exceed the allowed limit, which means that
+	 * the rq does not have more task that it can have, the
+	 * push do nothing
+	 */
+	if (!global_sched_dl_xf_invariance_enabled() && !xf_dl_rq_bw_exceed(rq))
+		return 0;
+
+	next_task = pick_next_pushable_dl_task(rq);
+	if (!next_task)
+		return 0;
+
+retry:
+	if (WARN_ON(next_task == rq->curr))
+		return 0;
+
+	/* We might release rq lock */
+	get_task_struct(next_task);
+
+	/* Will lock the rq it'll find */
+	suitable_rq = find_lock_xf_suitable_rq(next_task, rq);
+
+	/*
+	 * It doesn't make sense to proceed with the
+	 * push if we have to fallback to gEDF.
+	 */
+	if (global_sched_dl_fallback_to_gedf() && rq->dl.fallback_to_gedf)
+		goto out;
+
+	if (!suitable_rq) {
+		struct task_struct *task;
+
+		/*
+		 * We must check all this again, since
+		 * find_lock_suitable_rq releases rq->lock and it is
+		 * then possible that next_task has migrated.
+		 */
+		task = pick_next_pushable_dl_task(rq);
+		if (task == next_task) {
+			/*
+			 * The task is still there. We don't try
+			 * again, some other CPU will pull it when ready.
+			 */
+			goto out;
+		}
+
+		if (!task)
+			/* No more tasks */
+			goto out;
+
+		put_task_struct(next_task);
+		next_task = task;
+		goto retry;
+	}
+
+	deactivate_task(rq, next_task, 0);
+	set_task_cpu(next_task, suitable_rq->cpu);
+
+	/*
+	 * Update the later_rq clock here, because the clock is used
+	 * by the cpufreq_update_util() inside __add_running_bw().
+	 */
+	update_rq_clock(suitable_rq);
+	activate_task(suitable_rq, next_task, ENQUEUE_NOCLOCK);
+	ret = 1;
+
+	resched_curr(suitable_rq);
+
+	double_unlock_balance(rq, suitable_rq);
+
+out:
+	put_task_struct(next_task);
+
+	return ret;
+}
+
+static int push_dl_task(struct rq *rq) {
+	int ret = 0;
+
+	if (global_sched_dl_is_first_fit() || global_sched_dl_is_worst_fit())
+		ret = push_dl_task_xf(rq);
+
+	/*
+	 * Use gEDF whether it is the current sched_dl_policy or when
+	 * fallback to gEDF is enable and it is required as well.
+	 */
+	if (global_sched_dl_is_gedf() ||
+	    (global_sched_dl_fallback_to_gedf() && rq->dl.fallback_to_gedf)) {
+		ret = push_dl_task_global_edf(rq);
+
+		if (rq->dl.fallback_to_gedf)
+			rq->dl.fallback_to_gedf = 0;
+	}
+
+	return ret;
+}
+
 static void push_dl_tasks(struct rq *rq)
 {
 	/* push_dl_task() will return true if it moved a -deadline task */
@@ -2130,7 +2453,7 @@ static void push_dl_tasks(struct rq *rq)
 		;
 }
 
-static void pull_dl_task(struct rq *this_rq)
+static void pull_dl_task_global_edf(struct rq *this_rq)
 {
 	int this_cpu = this_rq->cpu, cpu;
 	struct task_struct *p;
@@ -2209,6 +2532,24 @@ skip:
 
 	if (resched)
 		resched_curr(this_rq);
+}
+
+static void pull_dl_task_first_fit(struct rq *this_rq)
+{
+}
+
+static void pull_dl_task_worst_fit(struct rq *this_rq)
+{
+}
+
+static void pull_dl_task(struct rq *this_rq)
+{
+	if (global_sched_dl_is_first_fit())
+		pull_dl_task_first_fit(this_rq);
+	else if (global_sched_dl_is_worst_fit())
+		pull_dl_task_worst_fit(this_rq);
+	else
+		pull_dl_task_global_edf(this_rq);
 }
 
 /*

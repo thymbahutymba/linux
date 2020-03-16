@@ -645,6 +645,8 @@ struct dl_rq {
 
 	unsigned long		dl_nr_running;
 
+	bool			fallback_to_gedf;
+
 #ifdef CONFIG_SMP
 	/*
 	 * Deadline values of the currently executing and the
@@ -1659,6 +1661,43 @@ static inline u64 global_rt_runtime(void)
 	return (u64)sysctl_sched_rt_runtime * NSEC_PER_USEC;
 }
 
+static inline u64 global_sched_dl_xf_runtime(void)
+{
+	if (sysctl_sched_dl_xf_runtime < 0)
+		return RUNTIME_INF;
+
+	return (u64)sysctl_sched_dl_xf_runtime * NSEC_PER_USEC;
+}
+
+#define SCHED_DL_GEDF (0)
+#define SCHED_DL_FF (1)
+#define SCHED_DL_WF (2)
+
+static inline unsigned int global_sched_dl_is_gedf(void)
+{
+	return sysctl_sched_dl_policy == SCHED_DL_GEDF;
+}
+
+static inline unsigned int global_sched_dl_is_first_fit(void)
+{
+	return sysctl_sched_dl_policy == SCHED_DL_FF;
+}
+
+static inline unsigned int global_sched_dl_is_worst_fit(void)
+{
+	return sysctl_sched_dl_policy == SCHED_DL_WF;
+}
+
+static inline unsigned int global_sched_dl_fallback_to_gedf(void)
+{
+	return sysctl_sched_dl_fallback_to_gedf;
+}
+
+static inline unsigned int global_sched_dl_xf_invariance_enabled(void)
+{
+	return sysctl_sched_dl_xf_invariance;
+}
+
 static inline int task_current(struct rq *rq, struct task_struct *p)
 {
 	return rq->curr == p;
@@ -1741,6 +1780,7 @@ extern const u32		sched_prio_to_wmult[40];
 #else
 #define ENQUEUE_MIGRATED	0x00
 #endif
+#define ENQUEUE_SETSCHED	0x80
 
 #define RETRY_TASK		((void *)-1UL)
 
