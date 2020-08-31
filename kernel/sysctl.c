@@ -472,6 +472,15 @@ static struct ctl_table kern_table[] = {
 		.mode		= 0644,
 		.proc_handler	= sched_rt_handler,
 	},
+	{
+		.procname	= "sched_dl_xf_pull",
+		.data		= &sysctl_sched_dl_xf_pull,
+		.maxlen		= sizeof(unsigned int),
+		.mode		= 0644,
+		.proc_handler = proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
 #ifdef CONFIG_UCLAMP_TASK
 	{
 		.procname	= "sched_util_clamp_min",

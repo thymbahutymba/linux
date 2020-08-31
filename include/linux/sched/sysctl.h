@@ -60,6 +60,7 @@ extern int sysctl_sched_dl_xf_runtime;
 extern unsigned int sysctl_sched_dl_xf_invariance;
 extern unsigned int sysctl_sched_dl_policy;
 extern unsigned int sysctl_sched_dl_fallback_to_gedf;
+extern unsigned int sysctl_sched_dl_xf_pull;
 
 #ifdef CONFIG_UCLAMP_TASK
 extern unsigned int sysctl_sched_uclamp_util_min;

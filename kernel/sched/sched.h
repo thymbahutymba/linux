@@ -1698,6 +1698,11 @@ static inline unsigned int global_sched_dl_xf_invariance_enabled(void)
 	return sysctl_sched_dl_xf_invariance;
 }
 
+static inline unsigned int global_sched_dl_xf_pull(void)
+{
+	return sysctl_sched_dl_xf_pull;
+}
+
 static inline int task_current(struct rq *rq, struct task_struct *p)
 {
 	return rq->curr == p;

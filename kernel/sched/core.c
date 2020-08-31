@@ -86,6 +86,7 @@ unsigned int sysctl_sched_dl_fallback_to_gedf = 0;
  * is skipped in order to always apply the xf policy.
  */
 unsigned int sysctl_sched_dl_xf_invariance = 0;
+unsigned int sysctl_sched_dl_xf_pull = 0;
 
 /*
  * __task_rq_lock - lock the rq @p resides on.

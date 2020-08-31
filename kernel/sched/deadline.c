@@ -2453,6 +2453,8 @@ static void push_dl_tasks(struct rq *rq)
 		;
 }
 
+atomic_t sched_dl_pulls = ATOMIC_INIT(0);
+
 static void pull_dl_task_global_edf(struct rq *this_rq)
 {
 	int this_cpu = this_rq->cpu, cpu;
@@ -2471,7 +2473,8 @@ static void pull_dl_task_global_edf(struct rq *this_rq)
 	smp_rmb();
 
 	for_each_cpu(cpu, this_rq->rd->dlo_mask) {
-		if (this_cpu == cpu)
+		if (this_cpu == cpu || (!global_sched_dl_is_gedf() &&
+					!xf_dl_rq_bw_exceed(cpu_rq(cpu))))
 			continue;
 
 		src_rq = cpu_rq(cpu);
@@ -2524,6 +2527,7 @@ static void pull_dl_task_global_edf(struct rq *this_rq)
 			activate_task(this_rq, p, 0);
 			dmin = p->dl.deadline;
 
+			atomic_inc(&sched_dl_pulls);
 			/* Is there any other task even earlier? */
 		}
 skip:
@@ -2534,21 +2538,196 @@ skip:
 		resched_curr(this_rq);
 }
 
+#define for_each_cpu_reverse(cpu, orig_mask, local_mask)                       \
+	for ((cpu) = -1, cpumask_copy((&local_mask), (orig_mask));             \
+	     (cpu) = cpumask_last((&local_mask)), (cpu) < nr_cpu_ids;          \
+	     cpumask_clear_cpu((cpu), (&local_mask)))
+
 static void pull_dl_task_first_fit(struct rq *this_rq)
 {
+	int this_cpu = this_rq->cpu, cpu;
+	struct task_struct *p;
+	bool resched = false;
+	struct rq *src_rq;
+	u64 dmin = LONG_MAX;
+	cpumask_t local_mask;
+
+	if (likely(!dl_overloaded(this_rq)))
+		return;
+
+	/*
+	 * Match the barrier from dl_set_overloaded; this guarantees that if we
+	 * see overloaded we must also see the dlo_mask bit.
+	 */
+	smp_rmb();
+
+	for_each_cpu_reverse (cpu, this_rq->rd->dlo_mask, local_mask) {
+		/*
+		 * The rq from which we can pull task has to be of a cpu
+		 * greater than the current one in order to satisfy the ff
+		 */
+		if (cpu <= this_cpu)
+			break;
+
+		src_rq = cpu_rq(cpu);
+
+		/*
+		 * We are going to pull from src_rq iff its
+		 * bw is greater than the allowed limit
+		 */
+		if (!xf_dl_rq_bw_exceed(src_rq))
+			continue;
+
+		/*
+		 * It looks racy, abd it is! However, as in sched_rt.c,
+		 * we are fine with this.
+		 */
+		if (this_rq->dl.dl_nr_running &&
+		    dl_time_before(this_rq->dl.earliest_dl.curr,
+				   src_rq->dl.earliest_dl.next))
+			continue;
+
+		/* Might drop this_rq->lock */
+		double_lock_balance(this_rq, src_rq);
+
+		/*
+		 * If there are no more pullable tasks on the
+		 * rq, we're done with it.
+		 */
+		if (src_rq->dl.dl_nr_running <= 1)
+			goto skip;
+
+		p = pick_earliest_pushable_dl_task(src_rq, this_cpu);
+
+		/*
+		 * We found a task to be pulled if:
+		 *  - it preempts our current (if there's one),
+		 *  - it will preempt the last one we pulled (if any),
+		 *  - the task fit into the cpu's rq.
+		 */
+		if (p && dl_time_before(p->dl.deadline, dmin) &&
+		    (!this_rq->dl.dl_nr_running ||
+		     dl_time_before(p->dl.deadline,
+				    this_rq->dl.earliest_dl.curr)) &&
+		    xf_task_fit_cpu_rq(p, this_cpu)) {
+			WARN_ON(p == src_rq->curr);
+			WARN_ON(!task_on_rq_queued(p));
+
+			/*
+			 * Then we pull iff p has actually an earlier
+			 * deadline than the current task of its runqueue.
+			 */
+			if (dl_time_before(p->dl.deadline,
+					   src_rq->curr->dl.deadline))
+				goto skip;
+
+			resched = true;
+
+			deactivate_task(src_rq, p, 0);
+			set_task_cpu(p, this_cpu);
+			activate_task(this_rq, p, 0);
+			dmin = p->dl.deadline;
+
+			atomic_inc(&sched_dl_pulls);
+
+			/* Is there any other task even earlier? */
+		}
+	skip:
+		double_unlock_balance(this_rq, src_rq);
+	}
+
+	if (resched)
+		resched_curr(this_rq);
 }
 
 static void pull_dl_task_worst_fit(struct rq *this_rq)
 {
+	int this_cpu = this_rq->cpu, cpu;
+	struct task_struct *p, *task = NULL;
+	bool resched = false;
+	struct rq *src_rq, *target_rq;
+	u64 task_bw;
+
+	if (likely(!dl_overloaded(this_rq)))
+		return;
+
+	/*
+	 * Match the barrier from dl_set_overloaded; this guarantees that if we
+	 * see overloaded we must also see the dlo_mask bit.
+	 */
+	smp_rmb();
+
+	for_each_cpu (cpu, this_rq->rd->dlo_mask) {
+		if (cpu == this_cpu)
+			continue;
+
+		src_rq = cpu_rq(cpu);
+
+		double_lock_balance(this_rq, src_rq);
+
+		p = pick_earliest_pushable_dl_task(src_rq, this_cpu);
+
+		/*
+		 * Among all earliest pushable task is going to be
+		 * chosen the one that has the greater bw and fits
+		 * into the current rq.
+		 */
+		if (p && xf_task_fit_cpu_rq(p, this_cpu) &&
+		    (!task || p->dl.dl_bw > task_bw)) {
+			task = p;
+			task_bw = task->dl.dl_bw;
+			target_rq = src_rq;
+		}
+
+		double_unlock_balance(this_rq, src_rq);
+	}
+
+	if (task) {
+		double_lock_balance(this_rq, target_rq);
+
+		/*
+		 * If there are no more pullable tasks on the
+		 * rq, we're done with it.
+		 */
+		if (target_rq->dl.dl_nr_running <= 1)
+			goto skip;
+
+		/*
+		 * The task found before may not be in the rq anymore,
+		 * we are going to pick the earliest task again and,
+		 * whatever task it is, is enough that it requires the
+		 * same or more bw that the one found before.
+		 */
+		task = pick_earliest_pushable_dl_task(target_rq, this_cpu);
+
+		/* Check that the condition are the same that were before */
+		if (task->dl.dl_bw >= task_bw &&
+		    xf_task_fit_cpu_rq(task, this_cpu)) {
+			resched = true;
+
+			deactivate_task(target_rq, task, 0);
+			set_task_cpu(task, this_cpu);
+			activate_task(this_rq, task, 0);
+
+			atomic_inc(&sched_dl_pulls);
+		}
+
+	skip:
+		double_unlock_balance(this_rq, target_rq);
+	}
+
+	if (resched)
+		resched_curr(this_rq);
 }
 
 static void pull_dl_task(struct rq *this_rq)
 {
-	if (global_sched_dl_is_first_fit())
-		pull_dl_task_first_fit(this_rq);
-	else if (global_sched_dl_is_worst_fit())
+	if (global_sched_dl_xf_pull() && global_sched_dl_is_first_fit() &&
+	    !this_rq->dl.dl_nr_running)
+		pull_dl_task_global_edf(this_rq);
+	else if (global_sched_dl_xf_pull() && global_sched_dl_is_worst_fit())
 		pull_dl_task_worst_fit(this_rq);
-	else
+	else if (global_sched_dl_is_gedf())
 		pull_dl_task_global_edf(this_rq);
 }
 
