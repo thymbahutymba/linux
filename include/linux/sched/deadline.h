@@ -25,6 +25,11 @@ static inline bool dl_time_before(u64 a, u64 b)
 	return (s64)(a - b) < 0;
 }
 
+static inline bool dl_time_before_eq(u64 a, u64 b)
+{
+	return (s64)(a - b) <= 0;
+}
+
 #ifdef CONFIG_SMP
 
 struct root_domain;

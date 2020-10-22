@@ -2646,9 +2646,9 @@ static void pull_dl_task_worst_fit(struct rq *this_rq)
 	struct task_struct *p, *task = NULL;
 	bool resched = false;
 	struct rq *src_rq, *target_rq;
-	u64 task_bw;
+	u64 dmin = LONG_MAX;
 
-	if (likely(!dl_overloaded(this_rq)))
+	if (likely(!dl_overloaded(this_rq) || this_rq->dl.dl_nr_running > 0))
 		return;
 
 	/*
@@ -2673,10 +2673,10 @@ static void pull_dl_task_worst_fit(struct rq *this_rq)
 		 * into the current rq.
 		 */
 		if (p && xf_task_fit_cpu_rq(p, this_cpu) &&
-		    (!task || p->dl.dl_bw > task_bw)) {
+		    dl_time_before(p->dl.deadline, dmin)) {
 			task = p;
-			task_bw = task->dl.dl_bw;
 			target_rq = src_rq;
+			dmin = p->dl.deadline;
 		}
 
 		double_unlock_balance(this_rq, src_rq);
@@ -2701,7 +2701,7 @@ static void pull_dl_task_worst_fit(struct rq *this_rq)
 		task = pick_earliest_pushable_dl_task(target_rq, this_cpu);
 
 		/* Check that the condition are the same that were before */
-		if (task->dl.dl_bw >= task_bw &&
+		if (dl_time_before_eq(task->dl.deadline, dmin) &&
 		    xf_task_fit_cpu_rq(task, this_cpu)) {
 			resched = true;
 
